@@ -12,10 +12,12 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # Configuration
 BATCH_SIZE = 10
+MAX_CONCURRENT_BATCHES = 5
 
 # Thread-safe storage for drivers
 drivers = []
 drivers_lock = threading.Lock()
+batch_semaphore = threading.Semaphore(MAX_CONCURRENT_BATCHES)
 
 # ANSI Colors
 class Colors:
@@ -204,39 +206,94 @@ def login_procedure(driver, email, password, is_first_account):
 
 def process_batch(batch, batch_index):
     """Function to be run in a separate thread for each batch."""
-    thread_name = f"Batch-{batch_index + 1}"
-    threading.current_thread().name = thread_name
-    
-    log(f"Starting Batch {batch_index + 1} ({len(batch)} accounts)", "header")
-    
-    options = uc.ChromeOptions()
-    options.add_argument("--start-maximized")
-    options.add_argument("--guest")
-    
     try:
-        driver = uc.Chrome(options=options, use_subprocess=True)
+        thread_name = f"Batch-{batch_index + 1}"
+        threading.current_thread().name = thread_name
         
-        # Randomize window size slightly for extra 'human-ness'
+        log(f"Starting Batch {batch_index + 1} ({len(batch)} accounts)", "header")
+        
+        def create_driver():
+            opts = uc.ChromeOptions()
+            opts.add_argument("--start-maximized")
+            opts.add_argument("--guest")
+            d = uc.Chrome(options=opts, use_subprocess=True)
+            try:
+                 width = random.randint(1200, 1400)
+                 height = random.randint(800, 1000)
+                 d.set_window_size(width, height)
+            except:
+                 pass
+            return d
+
         try:
-             width = random.randint(1200, 1400)
-             height = random.randint(800, 1000)
-             driver.set_window_size(width, height)
-        except:
-             pass
+            driver = create_driver()
 
-        with drivers_lock:
-            drivers.append(driver)
+            with drivers_lock:
+                drivers.append(driver)
 
-        for index, (email, password) in enumerate(batch):
-            is_first = (index == 0)
-            login_procedure(driver, email, password, is_first)
-            # Longer pause between accounts to look natural
-            time.sleep(random.uniform(5, 10)) 
+            def is_driver_alive(d):
+                try:
+                    # Simple check to see if driver is responsive
+                    _ = d.current_window_handle
+                    return True
+                except:
+                    return False
 
-        log(f"Batch {batch_index + 1} completed.", "success")
-    
-    except Exception as e:
-        log(f"Critical error in batch {batch_index + 1}: {e}", "error")
+            def restart_driver():
+                nonlocal driver
+                log(f"Driver appears dead. Restarting...", "warning")
+                try:
+                    driver.quit()
+                except:
+                    pass
+                
+                # Remove old driver from list if present
+                with drivers_lock:
+                    if driver in drivers:
+                        drivers.remove(driver)
+
+                driver = create_driver()
+                
+                with drivers_lock:
+                    drivers.append(driver)
+                return driver
+
+            for index, (email, password) in enumerate(batch):
+                # Check if driver is alive before processing
+                if not is_driver_alive(driver):
+                    driver = restart_driver()
+                    # If we restarted, this account is effectively the "first" in the new session
+                    is_first = True
+                else:
+                    is_first = (index == 0)
+
+                try:
+                    login_procedure(driver, email, password, is_first)
+                except Exception as e:
+                    # If login_procedure failed due to a critical driver error (like window closed during exec),
+                    # we catch it here. If the driver is dead, we'll likely catch it in the NEXT loop iteration,
+                    # BUT if it crashes MID-login, we might want to retry or just move on.
+                    # For now, we log it. The next iteration's health check will handle the restart.
+                    log(f"Error processing {email}: {e}. Checking driver health...", "error")
+                    if "no such window" in str(e) or "target window already closed" in str(e):
+                         # Force restart immediately for next loop
+                         log(f"Critical window error detected. Driver will be restarted next iteration.", "warning")
+                         try:
+                             driver.quit()
+                         except: 
+                            pass
+
+                # Longer pause between accounts to look natural
+                time.sleep(random.uniform(5, 10)) 
+
+            log(f"Batch {batch_index + 1} completed.", "success")
+        
+        except Exception as e:
+            log(f"Critical error in batch {batch_index + 1}: {e}", "error")
+
+    finally:
+        # Release the semaphore so the next batch can start
+        batch_semaphore.release()
 
 def main():
     log("Gmail Login Automation Started (Advanced Human-Like Mode)", "header")
@@ -253,6 +310,9 @@ def main():
 
     threads = []
     for i, batch in enumerate(batches):
+        # Wait for a slot to open if we have reached max concurrency
+        batch_semaphore.acquire()
+        
         t = threading.Thread(target=process_batch, args=(batch, i))
         threads.append(t)
         t.start()
